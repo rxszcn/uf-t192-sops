@@ -39,6 +39,7 @@ package sops // import "github.com/getsops/sops/v3"
 import (
 	"crypto/rand"
 	"crypto/sha512"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"regexp"
@@ -348,6 +349,8 @@ func (branch TreeBranch) walkValue(in interface{}, path []string, commentsStack 
 		return onLeaves(in, path, commentsStack)
 	case float64:
 		return onLeaves(in, path, commentsStack)
+	case json.Number:
+		return onLeaves(in, path, commentsStack)
 	case time.Time:
 		return onLeaves(in, path, commentsStack)
 	case Comment:
@@ -516,6 +519,18 @@ func (tree Tree) shouldBeEncrypted(path []string, commentsStack [][]string, isCo
 	return encrypted
 }
 
+// strTypeSuffix is the ENC type tag suffix the cipher produces for string
+// values.
+const strTypeSuffix = ",type:str]"
+
+// numberTypeSuffix is the ENC type tag suffix used for json.Number values.
+// The cipher's type dispatch has no json.Number case, so Tree.Encrypt
+// encrypts the number's original text as a string and rewrites the type tag
+// from str to num; Tree.Decrypt uses the tag to restore the json.Number type.
+// Genuine strings always keep the str tag, so their type judgment, MAC and
+// type metadata stay consistent.
+const numberTypeSuffix = ",type:num]"
+
 // Encrypt walks over the tree and encrypts all values with the provided cipher,
 // except those whose key ends with the UnencryptedSuffix specified on the
 // Metadata struct, those not ending with EncryptedSuffix, if EncryptedSuffix
@@ -555,7 +570,22 @@ func (tree Tree) Encrypt(key []byte, cipher Cipher) (string, error) {
 			if encrypted {
 				var err error
 				pathString := strings.Join(path, ":") + ":"
-				in, err = cipher.Encrypt(in, key, pathString)
+				if n, isNumber := in.(json.Number); isNumber {
+					// The cipher cannot handle json.Number directly: encrypt
+					// the number's original text as a string, then rewrite
+					// the ENC type tag so decryption can restore the type.
+					// The MAC above already covered the same original text.
+					var enc string
+					enc, err = cipher.Encrypt(n.String(), key, pathString)
+					if err == nil {
+						if strings.HasSuffix(enc, strTypeSuffix) {
+							enc = enc[:len(enc)-len(strTypeSuffix)] + numberTypeSuffix
+						}
+						in = enc
+					}
+				} else {
+					in, err = cipher.Encrypt(in, key, pathString)
+				}
 				if err != nil {
 					return nil, fmt.Errorf("Could not encrypt value: %s", err)
 				}
@@ -623,9 +653,30 @@ func (tree Tree) Decrypt(key []byte, cipher Cipher) (string, error) {
 						v = c
 					}
 				} else if inStr, inIsStr := in.(string); inIsStr {
-					v, err = cipher.Decrypt(inStr, key, pathString)
-					if err != nil {
-						return nil, fmt.Errorf("Could not decrypt value: %s", err)
+					if strings.HasSuffix(inStr, numberTypeSuffix) {
+						// A json.Number encrypted as a string with a
+						// rewritten type tag: decrypt as a string, then
+						// restore the json.Number type so stores can emit
+						// the original literal and the MAC stays consistent.
+						var dec interface{}
+						dec, err = cipher.Decrypt(inStr[:len(inStr)-len(numberTypeSuffix)]+strTypeSuffix, key, pathString)
+						if err != nil {
+							return nil, fmt.Errorf("Could not decrypt value: %s", err)
+						}
+						numStr, ok := dec.(string)
+						if !ok {
+							return nil, fmt.Errorf("Expected string for number value, but got %T", dec)
+						}
+						var num json.Number
+						if uerr := json.Unmarshal([]byte(numStr), &num); uerr != nil {
+							return nil, fmt.Errorf("Could not decrypt value: invalid number literal %q", numStr)
+						}
+						v = num
+					} else {
+						v, err = cipher.Decrypt(inStr, key, pathString)
+						if err != nil {
+							return nil, fmt.Errorf("Could not decrypt value: %s", err)
+						}
 					}
 				} else {
 					return nil, fmt.Errorf("Expected encrypted value as string, but got %T", in)
@@ -976,7 +1027,7 @@ func (m Metadata) GetDataKey() ([]byte, error) {
 	}, nil)
 }
 
-// ToBytes converts a string, int, float or bool to a byte representation.
+// ToBytes converts a string, int, float, json.Number or bool to a byte representation.
 func ToBytes(in interface{}) ([]byte, error) {
 	switch in := in.(type) {
 	case string:
@@ -985,6 +1036,10 @@ func ToBytes(in interface{}) ([]byte, error) {
 		return []byte(strconv.Itoa(in)), nil
 	case float64:
 		return []byte(strconv.FormatFloat(in, 'f', -1, 64)), nil
+	case json.Number:
+		// json.Number carries the number's original text; the MAC covers it
+		// byte-for-byte.
+		return []byte(in.String()), nil
 	case bool:
 		boolB := []byte("True")
 		if !in {

@@ -1,9 +1,11 @@
 package json
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/getsops/sops/v3"
+	"github.com/getsops/sops/v3/aes"
 	"github.com/getsops/sops/v3/config"
 	"github.com/stretchr/testify/assert"
 )
@@ -169,6 +171,71 @@ func TestIntegerBoundaries(t *testing.T) {
 		assert.Nil(t, err)
 		assert.Equal(t, string(in), string(out), "value %s should round-trip exactly", lit)
 	}
+}
+
+// TestBeyondInt64IntegerRoundtrip pins the full encrypt/decrypt round trip for
+// integers beyond the int64 range (e.g. snowflake IDs): they must be kept as
+// json.Number, encrypted losslessly, and decrypted back to the exact original
+// text, while a string holding the same digits keeps its string type.
+func TestBeyondInt64IntegerRoundtrip(t *testing.T) {
+	store := Store{config: config.JSONStoreConfig{Indent: -1}}
+	in := []byte("{\n\t\"snowflake\": 123456789012345678901234567890,\n\t\"max_int64_plus_one\": 9223372036854775808,\n\t\"string_id\": \"123456789012345678901234567890\"\n}")
+	branches, err := store.LoadPlainFile(in)
+	assert.Nil(t, err)
+	// Integers beyond int64 keep their original text as json.Number; the
+	// string holding the same digits stays a string.
+	assert.IsType(t, json.Number(""), branches[0][0].Value)
+	assert.IsType(t, json.Number(""), branches[0][1].Value)
+	assert.IsType(t, "", branches[0][2].Value)
+
+	tree := sops.Tree{Branches: branches}
+	cipher := aes.NewCipher()
+	mac, err := tree.Encrypt(make([]byte, 32), cipher)
+	assert.Nil(t, err)
+	// Numbers ride the string cipher path with a rewritten num type tag;
+	// the genuine string keeps the str tag.
+	assert.Contains(t, branches[0][0].Value.(string), ",type:num]")
+	assert.Contains(t, branches[0][1].Value.(string), ",type:num]")
+	assert.Contains(t, branches[0][2].Value.(string), ",type:str]")
+
+	mac2, err := tree.Decrypt(make([]byte, 32), cipher)
+	assert.Nil(t, err)
+	assert.Equal(t, mac, mac2, "MAC must be computed over the same original text on both sides")
+
+	out, err := store.EmitPlainFile(tree.Branches)
+	assert.Nil(t, err)
+	assert.Equal(t, string(in)+"\n", string(out), "decrypted output must be byte-identical to the original")
+}
+
+// TestHighPrecisionDecimalRoundtrip pins the full encrypt/decrypt round trip
+// for decimals whose precision float64 cannot represent: they must be kept as
+// json.Number and decrypted back to the exact original text, while a decimal
+// that float64 represents exactly keeps the existing float64 behavior.
+func TestHighPrecisionDecimalRoundtrip(t *testing.T) {
+	store := Store{config: config.JSONStoreConfig{Indent: -1}}
+	in := []byte("{\n\t\"precise\": 0.123456789012345678901234567890,\n\t\"trailing_zeros\": 1.50000000000000000001,\n\t\"plain\": 0.1\n}")
+	branches, err := store.LoadPlainFile(in)
+	assert.Nil(t, err)
+	assert.IsType(t, json.Number(""), branches[0][0].Value)
+	assert.IsType(t, json.Number(""), branches[0][1].Value)
+	assert.IsType(t, float64(0), branches[0][2].Value)
+
+	tree := sops.Tree{Branches: branches}
+	cipher := aes.NewCipher()
+	mac, err := tree.Encrypt(make([]byte, 32), cipher)
+	assert.Nil(t, err)
+	assert.Contains(t, branches[0][0].Value.(string), ",type:num]")
+	assert.Contains(t, branches[0][1].Value.(string), ",type:num]")
+	// 0.1 round-trips exactly through float64, so it keeps the float path.
+	assert.Contains(t, branches[0][2].Value.(string), ",type:float]")
+
+	mac2, err := tree.Decrypt(make([]byte, 32), cipher)
+	assert.Nil(t, err)
+	assert.Equal(t, mac, mac2, "MAC must be computed over the same original text on both sides")
+
+	out, err := store.EmitPlainFile(tree.Branches)
+	assert.Nil(t, err)
+	assert.Equal(t, string(in)+"\n", string(out), "decrypted output must be byte-identical to the original")
 }
 
 func TestDecodeNumber(t *testing.T) {

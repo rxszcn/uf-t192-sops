@@ -133,9 +133,13 @@ func (store Store) sliceFromJSONDecoder(dec *json.Decoder) ([]interface{}, error
 }
 
 // normalizeJSONNumber converts a json.Number scalar (produced because the
-// decoder runs with UseNumber) into an int for integers within the int64 range
-// and a float64 otherwise. Non-number tokens are returned unchanged; a number
-// representable as neither returns the json.Number.Float64 error.
+// decoder runs with UseNumber) into an int for integers within the int64
+// range, or a float64 when the float64 re-encodes (via json.Marshal, the same
+// encoding the store emits) to the exact original text. Any other number —
+// integers beyond the int64 range such as snowflake IDs, and decimals whose
+// precision float64 cannot represent — is kept as a json.Number so the
+// original text is preserved byte-for-byte instead of being silently
+// truncated. Non-number tokens are returned unchanged.
 func normalizeJSONNumber(t interface{}) (interface{}, error) {
 	n, ok := t.(json.Number)
 	if !ok {
@@ -144,11 +148,12 @@ func normalizeJSONNumber(t interface{}) (interface{}, error) {
 	if i, err := n.Int64(); err == nil {
 		return int(i), nil
 	}
-	f, err := n.Float64()
-	if err != nil {
-		return nil, err
+	if f, err := n.Float64(); err == nil {
+		if b, merr := json.Marshal(f); merr == nil && string(b) == n.String() {
+			return f, nil
+		}
 	}
-	return f, nil
+	return n, nil
 }
 
 var errEndOfObject = fmt.Errorf("End of object")
@@ -219,6 +224,10 @@ func (store Store) encodeValue(v interface{}) ([]byte, error) {
 		return store.encodeTree(v)
 	case []interface{}:
 		return store.encodeArray(v)
+	case json.Number:
+		// json.Number holds the original literal text; emit it verbatim so
+		// big integers and high-precision decimals survive the round trip.
+		return []byte(v.String()), nil
 	default:
 		return json.Marshal(v)
 	}
@@ -280,7 +289,8 @@ func (store Store) jsonFromTreeBranch(branch sops.TreeBranch) ([]byte, error) {
 func (store Store) treeBranchFromJSON(in []byte) (sops.TreeBranch, error) {
 	dec := json.NewDecoder(bytes.NewReader(in))
 	// Decode numbers as json.Number instead of the default float64, then
-	// normalize each to int/float64 (see normalizeJSONNumber). The default
+	// normalize each to int/float64 where lossless, keeping the original
+	// text as json.Number otherwise (see normalizeJSONNumber). The default
 	// float64 silently loses precision for integers larger than 2^53.
 	dec.UseNumber()
 	value, err := dec.Token()
